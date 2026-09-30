@@ -361,15 +361,26 @@ func (c *EEBus) writeCurrentLimitData(evEntity spineapi.EntityRemoteInterface, c
 		limits = append(limits, limit)
 	}
 
+	// Write the self-consumption recommendation (OSCEV) first and the overload
+	// protection obligation (OPEV) last.
+	//
+	// Both categories live in the same loadControlLimitListData. For EVSEs that do
+	// not support partial writes (e.g. Porsche PMCC) eebus-go sends the complete
+	// list and fills the limits of the other category from its local cache. That
+	// cache is only refreshed by the EVSE's notification, which arrives after the
+	// write has been acknowledged. Writing the recommendation after the obligation
+	// therefore re-sends the obligation with stale (inactive) values and releases
+	// the EV to the hardware maximum of the EVSE (32 A on a 32 A cable).
+	// With the obligation as the last write the EVSE always ends up with the
+	// intended current limit; a stale recommendation is bounded by the obligation.
+	c.writeOscevLimits(evEntity, current)
+
 	// always set overload protection limits (obligation)
 	if err := eebus.Await(func(cb func(model.ResultDataType, model.MsgCounterType)) (*model.MsgCounterType, error) {
 		return c.cem.OpEV.WriteLoadControlLimits(evEntity, limits, cb)
 	}); err != nil {
 		return err
 	}
-
-	// additionally set self-consumption recommendation limits if available
-	c.writeOscevLimits(evEntity, current)
 
 	c.mux.Lock()
 	defer c.mux.Unlock()
@@ -434,12 +445,13 @@ func (c *EEBus) maxCurrentMillis(current float64) error {
 		return nil
 	}
 
+	// report write failures so the loadpoint retries instead of assuming the limit is set
 	err := c.writeCurrentLimitData(evEntity, current)
 	if err == nil {
 		c.current = current
 	}
 
-	return nil
+	return err
 }
 
 // CurrentPower implements the api.Meter interface
