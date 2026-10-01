@@ -11,6 +11,7 @@ import (
 	ucapi "github.com/enbility/eebus-go/usecases/api"
 	"github.com/enbility/eebus-go/usecases/cem/evcc"
 	"github.com/enbility/eebus-go/usecases/cem/evcem"
+	"github.com/enbility/eebus-go/usecases/cem/opev"
 	spineapi "github.com/enbility/spine-go/api"
 	"github.com/enbility/spine-go/model"
 	"github.com/evcc-io/evcc/api"
@@ -44,9 +45,10 @@ type EEBus struct {
 
 	lastIdentification []string // last non-empty vehicle identification
 
-	enabled   bool
-	reconnect bool
-	current   float64
+	enabled      bool
+	reconnect    bool // limit must be re-written after EV connect
+	initialLimit bool // write the limit as soon as the EVSE provides limit data
+	current      float64
 
 	connector *eebus.Connector
 }
@@ -152,6 +154,7 @@ func (c *EEBus) Connect(connected bool) {
 	defer c.mux.Unlock()
 
 	c.ev = nil
+	c.initialLimit = false
 	c.lastIdentification = nil
 }
 
@@ -165,10 +168,22 @@ func (c *EEBus) UseCaseEvent(device spineapi.DeviceRemoteInterface, entity spine
 	case evcc.EvConnected:
 		c.ev = entity
 		c.reconnect = true
+		c.initialLimit = true
 
 	case evcc.EvDisconnected:
 		c.ev = nil
+		c.initialLimit = false
 		c.lastIdentification = nil
+
+	case opev.DataUpdateLimit:
+		// Without an active obligation some EVSEs (e.g. Porsche PMCC) release the
+		// hardware maximum current as soon as the EV is plugged in. Write the limit
+		// as soon as the EVSE's limit data is available instead of waiting for the
+		// next Status() poll, which may be a full loadpoint interval away.
+		if c.initialLimit && c.ev == entity {
+			c.initialLimit = false
+			go c.writeInitialLimit(entity)
+		}
 
 	case evcc.DataUpdateIdentifications:
 		// the identification may be withdrawn again before the loadpoint polls it
@@ -180,6 +195,27 @@ func (c *EEBus) UseCaseEvent(device spineapi.DeviceRemoteInterface, entity spine
 		// acknowledge limit change
 		c.limitUpdated = time.Time{}
 	}
+}
+
+// writeInitialLimit writes the current limit right after EV connect. Runs
+// asynchronously since the event handler holds the mutex and the write blocks
+// for the acknowledgement. On failure the reconnect flag stays set and Status()
+// retries the write on the next poll.
+func (c *EEBus) writeInitialLimit(evEntity spineapi.EntityRemoteInterface) {
+	var current float64
+	if c.enabled {
+		current = c.current
+	}
+
+	if err := c.writeCurrentLimitData(evEntity, current); err != nil {
+		c.log.DEBUG.Println("initial limit after ev connect:", err)
+		return
+	}
+
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	c.reconnect = false
 }
 
 func (c *EEBus) isEvConnected() (spineapi.EntityRemoteInterface, bool) {

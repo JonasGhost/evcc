@@ -8,6 +8,7 @@ import (
 	ucapi "github.com/enbility/eebus-go/usecases/api"
 	evccuc "github.com/enbility/eebus-go/usecases/cem/evcc"
 	evcemuc "github.com/enbility/eebus-go/usecases/cem/evcem"
+	opevuc "github.com/enbility/eebus-go/usecases/cem/opev"
 	"github.com/enbility/eebus-go/usecases/mocks"
 	spineapi "github.com/enbility/spine-go/api"
 	spinemocks "github.com/enbility/spine-go/mocks"
@@ -236,6 +237,39 @@ func TestWriteCurrentLimitData_ObligationWrittenLast(t *testing.T) {
 	err := eebus.writeCurrentLimitData(evEntity, 10)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"oscev", "opev"}, order)
+}
+
+// Without an active obligation the Porsche PMCC releases the hardware maximum as
+// soon as the EV is plugged in. The limit must therefore be written as soon as the
+// EVSE provides limit data, not only on the next Status() poll.
+func TestEEBusInitialLimitAfterConnect(t *testing.T) {
+	eebus, opevMock, oscev, evEntity := newTestEEBus(t)
+	eebus.ev = nil
+	eebus.current = 6
+
+	// charger disabled: the initial write must be a 0A obligation
+	opevMock.EXPECT().IsScenarioAvailableAtEntity(evEntity, uint(1)).Return(true).Once()
+	opevMock.EXPECT().CurrentLimits(evEntity).Return(opevLimits3p(6, 32, 0)).Once()
+	opevMock.EXPECT().WriteLoadControlLimits(evEntity, mock.MatchedBy(func(limits []ucapi.LoadLimitsPhase) bool {
+		return len(limits) == 3 && limits[0].IsActive && limits[0].Value == 0
+	}), mock.Anything).Run(ackWrite).Return(nil, nil).Once()
+	oscev.EXPECT().IsScenarioAvailableAtEntity(evEntity, uint(1)).Return(false).Once()
+
+	eebus.UseCaseEvent(nil, evEntity, evccuc.EvConnected)
+	assert.True(t, eebus.reconnect)
+
+	// limit data of the EVSE is available: write immediately
+	eebus.UseCaseEvent(nil, evEntity, opevuc.DataUpdateLimit)
+
+	require.Eventually(t, func() bool {
+		eebus.mux.RLock()
+		defer eebus.mux.RUnlock()
+		return !eebus.reconnect
+	}, time.Second, 10*time.Millisecond)
+
+	// the EVSE's notification of our own write must not trigger another write
+	eebus.UseCaseEvent(nil, evEntity, opevuc.DataUpdateLimit)
+	time.Sleep(50 * time.Millisecond)
 }
 
 // a failed obligation write must be reported to the loadpoint
